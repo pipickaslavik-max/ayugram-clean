@@ -47,7 +47,6 @@ jobs:
           git -C src log -1 --format='%H %s'
 
       - name: Set up Python
-        working-directory: .
         uses: actions/setup-python@v6
         with:
           python-version: '3.10'
