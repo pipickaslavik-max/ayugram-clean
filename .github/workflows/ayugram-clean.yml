@@ -1,0 +1,188 @@
+# Zero-egress AyuGram iOS build.
+# Lives in its own repository: clones mapix3/AyuGram-iOS at run time, applies
+# strip_telemetry.py, builds the unsigned IPA.
+#
+# Secrets required (Settings -> Secrets and variables -> Actions):
+#   TELEGRAM_API_ID, TELEGRAM_API_HASH  - from my.telegram.org
+#   APPLE_TEAM_ID                       - 10 characters, any valid team id
+#   APP_BUNDLE_ID                       - your bundle identifier
+# Optional variable: AYUGRAM_RUNNER     - runner label that has Xcode 27.1 installed
+name: AyuGram iOS (clean)
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Variant to build'
+        type: choice
+        options: [standard, custom]
+        default: standard
+      configuration:
+        description: 'Device build configuration'
+        type: choice
+        options: [release_arm64, debug_arm64]
+        default: release_arm64
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ vars.AYUGRAM_RUNNER || 'macos-latest' }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+        working-directory: src
+    steps:
+      - name: Check out the build kit
+        uses: actions/checkout@v6
+
+      - name: Clone upstream AyuGram-iOS with submodules
+        working-directory: .
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch standard --recurse-submodules \
+            https://github.com/mapix3/AyuGram-iOS.git src
+          git -C src log -1 --format='%H %s'
+
+      - name: Set up Python
+        working-directory: .
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Strip telemetry (relay, stats, profile lookups, updates, AI relay)
+        run: python3 ../strip_telemetry.py .
+
+      - name: Check CI helpers
+        run: python -m unittest discover -s ci/tests -p 'test_*.py' -v
+
+      - name: Select the Xcode pinned in versions.json
+        run: |
+          set -euo pipefail
+          XCODE_VERSION="$(python -c 'import json; print(json.load(open("versions.json"))["xcode"])')"
+          DEVELOPER_DIR=""
+          FALLBACK=""
+          for app in /Applications/Xcode*.app; do
+            candidate="$app/Contents/Developer"
+            version="$("$candidate/usr/bin/xcodebuild" -version 2>/dev/null | head -1 | sed 's/^Xcode //')"
+            echo "$app -> ${version:-unknown}"
+            if [[ -n "$version" ]]; then
+              if [[ "$version" == "$XCODE_VERSION" ]]; then
+                DEVELOPER_DIR="$candidate"
+              fi
+              FALLBACK="$candidate"
+            fi
+          done
+          if [[ -z "$DEVELOPER_DIR" ]]; then
+            echo "::warning::Xcode ${XCODE_VERSION} is not installed on this runner; using the newest available"
+            DEVELOPER_DIR="$FALLBACK"
+          fi
+          [[ -n "$DEVELOPER_DIR" ]] || { echo "::error::No usable Xcode found"; exit 1; }
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          ACTUAL="$(xcodebuild -version | head -1 | sed 's/^Xcode //')"
+          if [[ "$ACTUAL" != "$XCODE_VERSION" ]]; then
+            echo "::warning::Building with Xcode ${ACTUAL} instead of ${XCODE_VERSION}"
+            python -c "import json,sys; p='versions.json'; d=json.load(open(p)); d['xcode']=sys.argv[1]; json.dump(d, open(p,'w'), indent=4)" "$ACTUAL"
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          df -h .
+
+      - name: Free disk space
+        run: |
+          set -uo pipefail
+          df -h /
+          KEEP="$(cd "${DEVELOPER_DIR%/Contents/Developer}" && pwd -P)"
+          [[ -n "$KEEP" && -x "$KEEP/Contents/Developer/usr/bin/xcodebuild" ]] || { echo "::error::Pinned Xcode not found"; exit 1; }
+          for app in /Applications/Xcode*.app; do
+            if [[ ! -L "$app" && "$(cd "$app" && pwd -P)" != "$KEEP" ]]; then
+              sudo rm -rf "$app" &
+            fi
+          done
+          xcrun simctl shutdown all 2>/dev/null || true
+          xcrun simctl delete all 2>/dev/null || true
+          xcrun simctl runtime delete all 2>/dev/null || true
+          sudo rm -rf ~/Library/Android /usr/local/share/dotnet ~/.dotnet ~/Library/Developer/CoreSimulator/Caches &
+          wait || true
+          df -h /
+
+      - name: Install the Metal toolchain
+        run: |
+          set -euo pipefail
+          if ! xcrun metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          for attempt in $(seq 1 60); do
+            if xcrun metal --version; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::The Metal toolchain did not become available"
+          exit 1
+
+      - name: Check build utilities
+        run: |
+          set -euo pipefail
+          if ! command -v ccache >/dev/null; then
+            brew install ccache
+          fi
+          ccache --version
+          node --version
+
+      - name: Restore Bazel cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-clean-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            bazel-clean-${{ github.ref_name }}-
+            bazel-clean-
+
+      - name: Check and build
+        env:
+          AYUGRAM_BAZEL_CACHE: /Users/runner/telegram-bazel-cache
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_BUNDLE_ID: ${{ secrets.APP_BUNDLE_ID }}
+          AYUGRAM_VARIANT: ${{ inputs.variant || 'standard' }}
+          AYUGRAM_CONFIGURATION: ${{ inputs.configuration || 'release_arm64' }}
+        run: python -u ci/ayugram_ci.py --source . --ci ci --output artifacts
+
+      - name: Save Bazel cache
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-clean-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Read build number
+        if: ${{ always() }}
+        id: manifest
+        run: |
+          if [[ -f artifacts/build-manifest.json ]]; then
+            BUILD_NUMBER="$(python -c 'import json; print(json.load(open("artifacts/build-manifest.json"))["build_number"])')"
+          else
+            BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          fi
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Save build artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ayugram-clean-${{ inputs.variant || 'standard' }}-${{ steps.manifest.outputs.build_number }}
+          path: |
+            src/artifacts/*.ipa
+            src/artifacts/build-manifest.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Remove generated credential files
+        if: ${{ always() }}
+        run: python ci/ayugram_ci.py --source . --cleanup-only
